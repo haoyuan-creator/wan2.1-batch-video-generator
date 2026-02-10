@@ -18,3 +18,4 @@ View your app in AI Studio: https://ai.studio/apps/drive/1g2itk2QPKuayFqZGetyxGC
 2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
 3. Run the app:
    `npm run dev`
+这是一个我在公司做的一个小项目，先用google ai studio 做了demo然后再vscode中用claude 的deepseek v3.2模型做了调试
