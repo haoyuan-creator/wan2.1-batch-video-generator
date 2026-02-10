@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm install:*)",
+      "Bash(dir:*)",
+      "Bash(npm run build:*)",
+      "Bash(npx tsc:*)",
+      "Bash(python -m pip install:*)",
+      "Bash(python -c:*)",
+      "Bash(netstat:*)",
+      "Bash(findstr:*)",
+      "Bash(/model glm-4.7)"
+    ]
+  }
+}

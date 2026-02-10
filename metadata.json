@@ -1,0 +1,5 @@
+{
+  "name": "Wan2.1 Batch Video Generator",
+  "description": "A specialized local tool to batch process Image-to-Video generation using your local ComfyUI (Port 8001) Wan2.1 workflow.",
+  "requestFramePermissions": []
+}
