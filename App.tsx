@@ -1,31 +1,93 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { Job, JobStatus, WorkflowConfig } from './types';
+import { Job, JobStatus, WorkflowConfig, ServerAddress, ServerStatus } from './types';
 import { checkConnection, uploadImage, generateWorkflow, queuePrompt, getDownloadUrl, getHistory, interruptExecution } from './services/comfyService';
 import { ConnectionStatus } from './components/ConnectionStatus';
 import { ConfigPanel } from './components/ConfigPanel';
 import { JobQueue } from './components/JobQueue';
+import { ServerManager } from './components/ServerManager';
 
 const DEFAULT_POSITIVE = "她们乘着宇宙飞船遨游太空";
 const DEFAULT_NEGATIVE = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走";
 
+// LocalStorage keys
+const STORAGE_SERVERS_KEY = 'wan2_servers';
+const STORAGE_SELECTED_SERVER_KEY = 'wan2_selected_server';
+
+// Load servers from localStorage
+const loadServers = (): ServerAddress[] => {
+  try {
+    const stored = localStorage.getItem(STORAGE_SERVERS_KEY);
+    if (stored) {
+      const parsed = JSON.parse(stored);
+      // Reset status to checking when loading
+      return parsed.map((s: ServerAddress) => ({ ...s, status: ServerStatus.CHECKING }));
+    }
+  } catch (e) {
+    console.error('Failed to load servers from localStorage:', e);
+  }
+  // Default server
+  return [{
+    id: 'default',
+    name: 'Default Server',
+    url: 'http://192.168.31.150:8001',
+    status: ServerStatus.CHECKING,
+  }];
+};
+
+// Load selected server ID from localStorage
+const loadSelectedServerId = (servers: ServerAddress[]): string => {
+  try {
+    const stored = localStorage.getItem(STORAGE_SELECTED_SERVER_KEY);
+    if (stored && servers.find(s => s.id === stored)) {
+      return stored;
+    }
+  } catch (e) {
+    console.error('Failed to load selected server from localStorage:', e);
+  }
+  return servers[0]?.id || '';
+};
+
 export default function App() {
+  // Server Management
+  const [servers, setServers] = useState<ServerAddress[]>(loadServers);
+  const [selectedServerId, setSelectedServerId] = useState<string>(() => loadSelectedServerId(loadServers()));
+
+  // Save servers to localStorage whenever they change
+  useEffect(() => {
+    localStorage.setItem(STORAGE_SERVERS_KEY, JSON.stringify(servers));
+  }, [servers]);
+
+  // Save selected server to localStorage
+  useEffect(() => {
+    localStorage.setItem(STORAGE_SELECTED_SERVER_KEY, selectedServerId);
+  }, [selectedServerId]);
+
+  // Get selected server
+  const selectedServer = servers.find(s => s.id === selectedServerId);
+
   // Config represents the "Default" settings for NEW files
   const [defaultConfig, setDefaultConfig] = useState<WorkflowConfig>({
     positivePrompt: DEFAULT_POSITIVE,
     negativePrompt: DEFAULT_NEGATIVE,
     seed: 88888,
     randomizeSeed: true,
-    serverAddress: 'http://192.168.31.150:8001',
-    width: 1280, // 默认横向分辨率 1280x720
+    serverAddress: selectedServer?.url || 'http://192.168.31.150:8001',
+    width: 1280,
     height: 720
   });
 
-  const [connected, setConnected] = useState(false);
+  // Update serverAddress in defaultConfig when selected server changes
+  useEffect(() => {
+    if (selectedServer) {
+      setDefaultConfig(prev => ({ ...prev, serverAddress: selectedServer.url }));
+    }
+  }, [selectedServerId, selectedServer]);
+
   const [jobs, setJobs] = useState<Job[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [isBatchRunning, setIsBatchRunning] = useState(false);
   const [isMixedContent, setIsMixedContent] = useState(false);
-  
+
   // Ref to track processing state inside callbacks
   const jobsRef = useRef(jobs);
   useEffect(() => {
@@ -34,31 +96,41 @@ export default function App() {
 
   // Mixed Content Check
   useEffect(() => {
-    if (typeof window !== 'undefined') {
+    if (typeof window !== 'undefined' && selectedServer) {
       const isPageHttps = window.location.protocol === 'https:';
-      const isServerHttp = defaultConfig.serverAddress.startsWith('http://') && !defaultConfig.serverAddress.startsWith('https://');
+      const isServerHttp = selectedServer.url.startsWith('http://') && !selectedServer.url.startsWith('https://');
       setIsMixedContent(isPageHttps && isServerHttp);
     }
-  }, [defaultConfig.serverAddress]);
+  }, [selectedServer]);
 
-  // Polling for HTTP connection
+  // Polling for HTTP connection - Check ALL servers
   useEffect(() => {
-    const check = async () => {
-      const isOk = await checkConnection(defaultConfig.serverAddress);
-      setConnected(isOk);
+    const checkAllServers = async () => {
+      const results = await Promise.all(
+        servers.map(async (server) => {
+          const isOk = await checkConnection(server.url);
+          return { id: server.id, status: isOk ? ServerStatus.CONNECTED : ServerStatus.DISCONNECTED };
+        })
+      );
+
+      setServers(prev => prev.map(s => ({
+        ...s,
+        status: results.find(r => r.id === s.id)?.status ?? ServerStatus.DISCONNECTED
+      })));
     };
-    check();
-    const interval = setInterval(check, 2000);
+
+    checkAllServers();
+    const interval = setInterval(checkAllServers, 2000);
     return () => clearInterval(interval);
-  }, [defaultConfig.serverAddress]);
+  }, [servers]);
 
-  // WebSocket Connection
+  // WebSocket Connection - connect to selected server only
   useEffect(() => {
-    if (!connected) return;
+    if (!selectedServer || selectedServer.status !== ServerStatus.CONNECTED) return;
 
-    const wsAddress = defaultConfig.serverAddress.replace(/^http/, 'ws').replace(/^https/, 'wss');
+    const wsAddress = selectedServer.url.replace(/^http/, 'ws').replace(/^https/, 'wss');
     const wsUrl = `${wsAddress}/ws`;
-    
+
     console.log(`[WS] Connecting to ${wsUrl}...`);
     const socket = new WebSocket(wsUrl);
 
@@ -69,33 +141,28 @@ export default function App() {
     socket.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data);
-        // console.log('[WS] Message:', msg.type, msg.data); // Debug log
 
         if (msg.type === 'execution_start') {
           console.log('[WS] Execution Started:', msg.data.prompt_id);
           updateJobStatusByPromptId(msg.data.prompt_id, JobStatus.PROCESSING);
         }
-        
+
         if (msg.type === 'progress' && msg.data.prompt_id) {
           const percent = Math.round((msg.data.value / msg.data.max) * 100);
           updateJobProgress(msg.data.prompt_id, percent);
         }
-        
+
         if (msg.type === 'execution_success') {
           console.log('[WS] Execution Success:', msg.data.prompt_id);
           handleJobSuccess(msg.data.prompt_id, msg.data.result?.outputs);
         }
-        
+
         if (msg.type === 'execution_error') {
           console.error('[WS] Execution Error:', msg.data);
           updateJobStatusByPromptId(msg.data.prompt_id, JobStatus.FAILED, msg.data.exception_message || "Workflow Error");
         }
 
-        // Sometimes ComfyUI sends "executing" with node: null to indicate done, 
-        // but execution_success is more reliable for data. 
-        // We keep this as a fallback or state cleaner if needed.
         if (msg.type === 'executing' && msg.data.node === null && msg.data.prompt_id) {
-           // Queue finished for this prompt - try to get results via history API
            console.log('[WS] Queue finished for prompt:', msg.data.prompt_id);
            handleQueueFinished(msg.data.prompt_id);
         }
@@ -116,8 +183,7 @@ export default function App() {
     return () => {
       socket.close();
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [connected, defaultConfig.serverAddress]);
+  }, [selectedServer, selectedServer?.status]);
 
   // --- JOB STATE HELPERS ---
 
@@ -129,7 +195,6 @@ export default function App() {
     setJobs(prev => prev.map(j => {
       if (j.promptId !== promptId) return j;
 
-      // Don't override FAILED status with COMPLETED (e.g., when job was cancelled)
       if (j.status === JobStatus.FAILED && status === JobStatus.COMPLETED) {
         console.log(`[StatusUpdate] Ignoring COMPLETED update for cancelled job ${j.id}`);
         return j;
@@ -153,44 +218,32 @@ export default function App() {
 
   const handleJobSuccess = (promptId: string, outputs: any) => {
     console.log(`[Success] Handling job success for prompt ${promptId}`, outputs);
-    // Determine which job matches this promptId
-    // We use functional update to ensure we have latest state if called asynchronously
     setJobs(prev => {
         return prev.map(j => {
             if (j.promptId !== promptId) return j;
 
-            // If job was already cancelled/failed, ignore success message
             if (j.status === JobStatus.FAILED) {
               console.log(`[Success] Ignoring success for cancelled job ${j.id} with prompt ${promptId}`);
               return j;
             }
 
             const saveNodeId = "108";
-            // ComfyUI output structure: { "NodeID": { "videos": [ { filename: "...", subfolder: "...", type: "..." } ] } }
-            console.log(`[Success] Looking for node ${saveNodeId} in outputs`, outputs);
-            // Try videos field first
             let videoData = outputs?.[saveNodeId]?.videos?.[0];
-            console.log(`[Success] Video data from videos field:`, videoData);
 
-            // If not found, try images field (some workflows might use images for video?)
             if (!videoData) {
               videoData = outputs?.[saveNodeId]?.images?.[0];
-              console.log(`[Success] Video data from images field:`, videoData);
             }
 
             if (videoData) {
-                // Generate URL with the provided data
-                const url = getDownloadUrl(defaultConfig.serverAddress, videoData.filename, videoData.subfolder, videoData.type);
+                const url = getDownloadUrl(j.config.serverAddress, videoData.filename, videoData.subfolder, videoData.type);
                 console.log(`[Success] Generated download URL: ${url}`);
 
-                // If filename contains path but subfolder is empty, try alternative
                 let altUrl: string | undefined;
                 if (!videoData.subfolder && videoData.filename.includes('/')) {
                   const parts = videoData.filename.split('/');
                   const filenameOnly = parts.pop()!;
                   const pathOnly = parts.join('/');
-                  altUrl = getDownloadUrl(defaultConfig.serverAddress, filenameOnly, pathOnly, videoData.type);
-                  console.log(`[Success] Alternative URL (extracted path): ${altUrl}`);
+                  altUrl = getDownloadUrl(j.config.serverAddress, filenameOnly, pathOnly, videoData.type);
                 }
 
                 return {
@@ -199,43 +252,22 @@ export default function App() {
                     progress: 100,
                     resultUrl: url,
                     resultFilename: videoData.filename,
-                    // Store alternative URL for fallback
                     _altUrl: altUrl
                 };
             } else {
-                // No video output found? Mark completed anyway but maybe warn
-                console.warn("Job completed but no video output found in node 108. Full outputs:", outputs);
-                // Try to find video data in any node
+                console.warn("Job completed but no video output found in node 108.");
                 for (const nodeId in outputs) {
                   const nodeOutput = outputs[nodeId];
                   if (nodeOutput) {
-                    // Check videos field
                     if (nodeOutput.videos && nodeOutput.videos.length > 0) {
-                      console.log(`[Success] Found video in alternative node ${nodeId} (videos field):`, nodeOutput.videos[0]);
                       const altVideoData = nodeOutput.videos[0];
-                      const url = getDownloadUrl(defaultConfig.serverAddress, altVideoData.filename, altVideoData.subfolder, altVideoData.type);
-                      console.log(`[Success] Generated download URL from alternative node: ${url}`);
-                      return {
-                        ...j,
-                        status: JobStatus.COMPLETED,
-                        progress: 100,
-                        resultUrl: url,
-                        resultFilename: altVideoData.filename
-                      };
+                      const url = getDownloadUrl(j.config.serverAddress, altVideoData.filename, altVideoData.subfolder, altVideoData.type);
+                      return { ...j, status: JobStatus.COMPLETED, progress: 100, resultUrl: url, resultFilename: altVideoData.filename };
                     }
-                    // Check images field
                     if (nodeOutput.images && nodeOutput.images.length > 0) {
-                      console.log(`[Success] Found image/video in alternative node ${nodeId} (images field):`, nodeOutput.images[0]);
                       const altVideoData = nodeOutput.images[0];
-                      const url = getDownloadUrl(defaultConfig.serverAddress, altVideoData.filename, altVideoData.subfolder, altVideoData.type);
-                      console.log(`[Success] Generated download URL from images field: ${url}`);
-                      return {
-                        ...j,
-                        status: JobStatus.COMPLETED,
-                        progress: 100,
-                        resultUrl: url,
-                        resultFilename: altVideoData.filename
-                      };
+                      const url = getDownloadUrl(j.config.serverAddress, altVideoData.filename, altVideoData.subfolder, altVideoData.type);
+                      return { ...j, status: JobStatus.COMPLETED, progress: 100, resultUrl: url, resultFilename: altVideoData.filename };
                     }
                   }
                 }
@@ -248,20 +280,18 @@ export default function App() {
   const handleQueueFinished = async (promptId: string) => {
     try {
       console.log(`[History] Fetching results for prompt ${promptId}...`);
-      const history = await getHistory(defaultConfig.serverAddress, promptId);
+      const job = jobs.find(j => j.promptId === promptId);
+      if (!job) return;
+
+      const history = await getHistory(job.config.serverAddress, promptId);
 
       if (history && history[promptId] && history[promptId].outputs) {
-        const outputs = history[promptId].outputs;
-        console.log(`[History] Retrieved outputs for prompt ${promptId}:`, outputs);
-        handleJobSuccess(promptId, outputs);
+        handleJobSuccess(promptId, history[promptId].outputs);
       } else {
-        console.warn(`[History] No outputs found in history for prompt ${promptId}`);
-        // Still mark as completed but with warning
         updateJobStatusByPromptId(promptId, JobStatus.COMPLETED);
       }
     } catch (err) {
       console.error(`[History] Failed to fetch history for prompt ${promptId}:`, err);
-      // Still mark as completed to avoid stuck jobs
       updateJobStatusByPromptId(promptId, JobStatus.COMPLETED);
     }
   };
@@ -273,15 +303,12 @@ export default function App() {
       const newJobs: Job[] = (Array.from(e.target.files) as File[]).map(file => ({
         id: Math.random().toString(36).substring(2, 11),
         file,
-        status: JobStatus.IDLE, // Start as IDLE
+        status: JobStatus.IDLE,
         progress: 0,
-        config: { ...defaultConfig } // COPY default config to job
+        config: { ...defaultConfig } // Uses current selected server
       }));
       setJobs(prev => [...prev, ...newJobs]);
       e.target.value = '';
-      
-      // Note: New jobs are always added with IDLE status, regardless of batch mode
-      // User must manually start each job or use Start All Pending button
     }
   };
 
@@ -294,14 +321,12 @@ export default function App() {
       const jobToDuplicate = prev.find(j => j.id === id);
       if (!jobToDuplicate) return prev;
 
-      // Create a new job with the same file and config, but new ID and reset status
       const newJob: Job = {
         id: Math.random().toString(36).substring(2, 11),
-        file: jobToDuplicate.file, // Same file reference
-        status: JobStatus.IDLE, // Start as IDLE
+        file: jobToDuplicate.file,
+        status: JobStatus.IDLE,
         progress: 0,
-        config: { ...jobToDuplicate.config }, // Copy config
-        // Do not copy resultUrl, promptId, etc. - fresh job
+        config: { ...jobToDuplicate.config },
       };
 
       return [...prev, newJob];
@@ -317,27 +342,20 @@ export default function App() {
     setJobs(prev => prev.map(j => {
       if (j.id !== id) return j;
 
-      // Reset PENDING jobs to IDLE (not started yet)
       if (j.status === JobStatus.PENDING) {
-        console.log(`[Stop] Job ${id} is PENDING, resetting to IDLE`);
         return { ...j, status: JobStatus.IDLE };
       }
 
-      // For jobs that are already sent to ComfyUI, try to interrupt execution
       if ([JobStatus.UPLOADING, JobStatus.QUEUED, JobStatus.PROCESSING].includes(j.status)) {
-        console.log(`[Stop] Job ${id} is active (${j.status}), attempting to interrupt ComfyUI execution`);
-        // Interrupt ComfyUI execution
-        interruptExecution(defaultConfig.serverAddress).then(success => {
+        interruptExecution(j.config.serverAddress).then(success => {
           console.log(`[Stop] Interrupt request ${success ? 'succeeded' : 'failed'} for job ${id}`);
         }).catch(err => {
           console.error(`[Stop] Error interrupting execution for job ${id}:`, err);
         });
 
-        // Mark as FAILED since it was cancelled by user
         return { ...j, status: JobStatus.FAILED, errorMessage: 'Cancelled by user' };
       }
 
-      // For other states (COMPLETED, FAILED, IDLE), just return as-is
       return j;
     }));
   };
@@ -347,10 +365,8 @@ export default function App() {
   const startBatch = () => {
     console.log('[StartBatch] Starting batch execution');
     setIsBatchRunning(true);
-    // Set only IDLE jobs to PENDING (ignore FAILED jobs - user should restart them manually)
     setJobs(prev => prev.map(j => {
       if (j.status === JobStatus.IDLE) {
-        console.log(`[StartBatch] Setting job ${j.id} from IDLE to PENDING`);
         return { ...j, status: JobStatus.PENDING };
       }
       return j;
@@ -361,24 +377,25 @@ export default function App() {
     console.log('[StopBatch] Stopping batch execution');
     setIsBatchRunning(false);
 
-    // First, interrupt ComfyUI execution to stop any currently processing jobs
-    try {
-      console.log('[StopBatch] Sending interrupt to ComfyUI');
-      const success = await interruptExecution(defaultConfig.serverAddress);
-      console.log(`[StopBatch] ComfyUI interrupt ${success ? 'succeeded' : 'failed'}`);
-    } catch (err) {
-      console.error('[StopBatch] Error interrupting ComfyUI:', err);
+    // Interrupt all active servers
+    const activeServers = new Set(jobs
+      .filter(j => [JobStatus.PENDING, JobStatus.UPLOADING, JobStatus.QUEUED, JobStatus.PROCESSING].includes(j.status))
+      .map(j => j.config.serverAddress)
+    );
+
+    for (const serverUrl of activeServers) {
+      try {
+        await interruptExecution(serverUrl);
+      } catch (err) {
+        console.error('[StopBatch] Error interrupting server:', serverUrl, err);
+      }
     }
 
-    // Reset all PENDING, UPLOADING, QUEUED, PROCESSING jobs
     setJobs(prev => prev.map(j => {
       if ([JobStatus.PENDING, JobStatus.UPLOADING, JobStatus.QUEUED, JobStatus.PROCESSING].includes(j.status)) {
-        console.log(`[StopBatch] Resetting job ${j.id} from ${j.status}`);
-        // For jobs that were actively processing, mark as FAILED
         if (j.status === JobStatus.PROCESSING || j.status === JobStatus.QUEUED || j.status === JobStatus.UPLOADING) {
           return { ...j, status: JobStatus.FAILED, errorMessage: 'Cancelled by user' };
         }
-        // For PENDING jobs (not started yet), reset to IDLE
         return { ...j, status: JobStatus.IDLE };
       }
       return j;
@@ -386,37 +403,18 @@ export default function App() {
   };
 
   const downloadAllCompleted = () => {
-    console.log('[Download] All jobs:', jobs.map(j => ({
-      id: j.id,
-      status: j.status,
-      resultUrl: j.resultUrl,
-      resultFilename: j.resultFilename,
-      promptId: j.promptId
-    })));
     const completedJobs = jobs.filter(j => j.status === JobStatus.COMPLETED && j.resultUrl);
-    console.log('[Download] Filtered completed jobs with resultUrl:', completedJobs.map(j => ({
-      id: j.id,
-      resultUrl: j.resultUrl,
-      filename: j.resultFilename,
-      promptId: j.promptId
-    })));
 
     if (completedJobs.length === 0) {
-      const completedWithoutUrl = jobs.filter(j => j.status === JobStatus.COMPLETED && !j.resultUrl);
-      console.log('[Download] Completed jobs without URL:', completedWithoutUrl);
-      alert(`No completed videos to download. Found ${completedJobs.length} with URL, ${completedWithoutUrl.length} without URL.`);
+      alert(`No completed videos to download.`);
       return;
     }
 
     if (!confirm(`Confirm download of ${completedJobs.length} videos? This may open multiple prompts.`)) return;
 
-    // Trigger downloads with a slight stagger to avoid browser blocking
     completedJobs.forEach((job, index) => {
       setTimeout(async () => {
-        console.log(`[Download] Downloading job ${job.id} from ${job.resultUrl}, filename: ${job.resultFilename}`);
-
         try {
-          // Fetch the file as a blob to force download instead of preview
           const response = await fetch(job.resultUrl!);
           if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
 
@@ -430,11 +428,8 @@ export default function App() {
           link.click();
           document.body.removeChild(link);
 
-          // Clean up the object URL after a short delay
           setTimeout(() => window.URL.revokeObjectURL(url), 100);
         } catch (error) {
-          console.error('[Download] Failed to download:', error);
-          // Fallback to direct link if fetch fails (e.g., CORS issues)
           const link = document.createElement('a');
           link.href = job.resultUrl!;
           link.target = '_blank';
@@ -452,18 +447,19 @@ export default function App() {
   const processQueue = useCallback(async () => {
     if (isProcessing) return;
 
-    // Use ref to get latest jobs state, avoiding stale closure
     const currentJobs = jobsRef.current;
 
-    // Check if any job is already active (UPLOADING, QUEUED, PROCESSING)
-    const hasActiveJob = currentJobs.some(j =>
-      [JobStatus.UPLOADING, JobStatus.QUEUED, JobStatus.PROCESSING].includes(j.status)
+    // Get all active servers
+    const activeServers = new Set(currentJobs
+      .filter(j => [JobStatus.UPLOADING, JobStatus.QUEUED, JobStatus.PROCESSING].includes(j.status))
+      .map(j => j.config.serverAddress)
     );
-    if (hasActiveJob) return;
 
-    // Find next PENDING job from the LATEST state
     const nextJob = currentJobs.find(j => j.status === JobStatus.PENDING);
-    if (!nextJob) return; // Wait for loop
+    if (!nextJob) return;
+
+    // Skip if this job's server is already processing something
+    if (activeServers.has(nextJob.config.serverAddress)) return;
 
     setIsProcessing(true);
 
@@ -474,16 +470,13 @@ export default function App() {
       const uniqueName = `${timestamp}_${nextJob.file.name.replace(/[^a-zA-Z0-9.-]/g, '_')}`;
       const renamedFile = new File([nextJob.file], uniqueName, { type: nextJob.file.type });
 
-      // Upload
-      const uploadedFilename = await uploadImage(defaultConfig.serverAddress, renamedFile);
+      const uploadedFilename = await uploadImage(nextJob.config.serverAddress, renamedFile);
 
-      // Generate Workflow using JOB SPECIFIC CONFIG
       updateJobStatus(nextJob.id, JobStatus.QUEUED);
       const workflow = generateWorkflow(uploadedFilename, nextJob.config);
 
-      // Queue
-      console.log(`[Queue] Sending job ${nextJob.id} to ComfyUI...`);
-      const response = await queuePrompt(defaultConfig.serverAddress, workflow);
+      console.log(`[Queue] Sending job ${nextJob.id} to ${nextJob.config.serverAddress}...`);
+      const response = await queuePrompt(nextJob.config.serverAddress, workflow);
       console.log(`[Queue] Job sent. Prompt ID: ${response.prompt_id}`);
 
       updateJobPromptId(nextJob.id, response.prompt_id);
@@ -494,70 +487,64 @@ export default function App() {
     } finally {
       setIsProcessing(false);
     }
-  }, [isProcessing, defaultConfig.serverAddress, updateJobStatus, updateJobPromptId]);
+  }, [isProcessing, updateJobStatus, updateJobPromptId]);
 
   // Loop trigger
   useEffect(() => {
-    // Use ref to get latest jobs state
     const currentJobs = jobsRef.current;
 
     const pending = currentJobs.some(j => j.status === JobStatus.PENDING);
     const hasActiveJob = currentJobs.some(j =>
       [JobStatus.UPLOADING, JobStatus.QUEUED, JobStatus.PROCESSING].includes(j.status)
     );
-    // Process queue if there are pending jobs AND no active job (works for both single task and batch mode)
-    if (pending && connected && !isProcessing && !hasActiveJob) {
+
+    if (pending && !isProcessing && !hasActiveJob) {
       processQueue();
     }
 
-    // Auto-stop batch mode if everything is done (no pending, no active)
     const hasActive = currentJobs.some(j => [JobStatus.PENDING, JobStatus.QUEUED, JobStatus.UPLOADING, JobStatus.PROCESSING].includes(j.status));
     if (!hasActive && isBatchRunning && currentJobs.length > 0) {
-      console.log('[AutoStop] All jobs completed, auto-stopping batch mode');
       setIsBatchRunning(false);
     }
-  }, [jobs, connected, isProcessing, isBatchRunning, processQueue]);
+  }, [jobs, isProcessing, isBatchRunning, processQueue]);
 
-  // Task status polling for stuck jobs
+  // Task status polling
   useEffect(() => {
-    if (!connected || jobs.length === 0) return;
+    if (jobs.length === 0) return;
 
     const interval = setInterval(async () => {
-      // Check jobs that are in active state
       const activeJobs = jobs.filter(j => {
         if (!j.promptId) return false;
-        // Only check jobs that are supposed to be processing
         if (![JobStatus.PROCESSING, JobStatus.QUEUED, JobStatus.UPLOADING].includes(j.status)) return false;
         return true;
       });
 
       for (const job of activeJobs) {
         try {
-          console.log(`[Polling] Checking active job ${job.id} with prompt ${job.promptId}`);
-          const history = await getHistory(defaultConfig.serverAddress, job.promptId!);
+          const history = await getHistory(job.config.serverAddress, job.promptId!);
           if (history && history[job.promptId!] && history[job.promptId!].outputs) {
-            const outputs = history[job.promptId!].outputs;
-            console.log(`[Polling] Found completed job ${job.id} via history API`);
-            handleJobSuccess(job.promptId!, outputs);
+            handleJobSuccess(job.promptId!, history[job.promptId!].outputs);
           }
         } catch (err) {
           console.warn(`[Polling] Failed to check history for job ${job.id}:`, err);
         }
       }
-    }, 10000); // Check every 10 seconds
+    }, 10000);
 
     return () => clearInterval(interval);
-  }, [jobs, connected, defaultConfig.serverAddress]);
-
+  }, [jobs]);
 
   // --- RENDER ---
 
   const pendingCount = jobs.filter(j => j.status === JobStatus.PENDING).length;
   const processingCount = jobs.filter(j => [JobStatus.UPLOADING, JobStatus.QUEUED, JobStatus.PROCESSING].includes(j.status)).length;
 
+  // Check if any server is connected
+  const anyServerConnected = servers.some(s => s.status === ServerStatus.CONNECTED);
+
   return (
     <div className="flex flex-col h-full bg-gray-950 text-gray-100 font-sans">
-      
+
       {/* Header */}
       <header className="flex-none bg-gray-900 border-b border-gray-800 p-4 flex justify-between items-center shadow-lg z-20">
         <div className="flex items-center space-x-3">
@@ -571,38 +558,46 @@ export default function App() {
             <p className="text-[10px] text-gray-500 font-mono uppercase tracking-widest">Local ComfyUI Controller</p>
           </div>
         </div>
-        
+
         <div className="flex items-center gap-4">
           <div className="hidden md:flex items-center gap-4 text-xs font-mono text-gray-500">
              <span>Tasks: {jobs.length}</span>
              <span className={processingCount > 0 ? "text-yellow-500 animate-pulse" : ""}>Active: {processingCount}</span>
              <span>Queue: {pendingCount}</span>
           </div>
-          <ConnectionStatus isConnected={connected} address={defaultConfig.serverAddress} />
+          <ConnectionStatus servers={servers} selectedServerId={selectedServerId} />
         </div>
       </header>
 
       {/* Main Layout */}
       <div className="flex-1 flex overflow-hidden">
-        
+
         {/* Sidebar */}
         <aside className="w-80 flex-none bg-gray-900 border-r border-gray-800 flex flex-col z-10">
           <div className="p-4 space-y-6 overflow-y-auto flex-1 custom-scrollbar">
-            
+
+            {/* Server Manager */}
+            <ServerManager
+              servers={servers}
+              selectedServerId={selectedServerId}
+              onServersChange={setServers}
+              onSelectedServerChange={setSelectedServerId}
+            />
+
             {/* Upload Area */}
             <div className="space-y-2">
               <h2 className="text-xs font-bold text-gray-400 uppercase tracking-wider">New Task</h2>
               <div className="relative group cursor-pointer">
-                <input 
-                  type="file" 
-                  multiple 
+                <input
+                  type="file"
+                  multiple
                   accept="image/*"
                   onChange={handleFileUpload}
                   className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-20"
                 />
                 <div className={`border-2 border-dashed rounded-xl p-6 flex flex-col items-center justify-center text-center transition-all bg-gray-800 ${
-                  isBatchRunning 
-                    ? 'border-green-600/30 hover:bg-green-900/10' 
+                  isBatchRunning
+                    ? 'border-green-600/30 hover:bg-green-900/10'
                     : 'border-gray-700 hover:border-blue-500 hover:bg-gray-800'
                 }`}>
                   <div className={`p-3 rounded-full mb-2 transition-colors ${
@@ -614,28 +609,28 @@ export default function App() {
                   </div>
                   <p className="text-sm font-bold text-gray-300">Add Images</p>
                   <p className="text-[10px] text-gray-500 mt-1">
-                    {isBatchRunning ? "Auto-Queues immediately" : "Adds to workspace"}
+                    {selectedServer ? `Using: ${selectedServer.name}` : 'No server selected'}
                   </p>
                 </div>
               </div>
             </div>
 
             {/* Default Config Panel */}
-            <ConfigPanel 
-              config={defaultConfig} 
-              onChange={setDefaultConfig} 
+            <ConfigPanel
+              config={defaultConfig}
+              onChange={setDefaultConfig}
               disabled={false}
             />
 
             {/* Error Display */}
-            {!connected && (
+            {!anyServerConnected && (
                <div className={`p-3 rounded-lg text-xs border ${
                   isMixedContent ? 'bg-orange-900/20 border-orange-800 text-orange-300' : 'bg-red-900/20 border-red-800 text-red-300'
                }`}>
                  <p className="font-bold mb-1">⚠ Connection Error</p>
-                 <p>{isMixedContent ? "Browser blocked HTTP connection (Mixed Content)." : "ComfyUI not reachable on port 8001."}</p>
-                 <p className="mt-2 opacity-75">1. Download code & run locally.</p>
-                 <p className="opacity-75">2. Run ComfyUI with: <code className="bg-black/30 px-1 rounded">--enable-cors-header "*"</code></p>
+                 <p>No ComfyUI servers connected. Please check your server configuration.</p>
+                 {isMixedContent && <p className="mt-2 opacity-75">Browser blocked HTTP connection (Mixed Content).</p>}
+                 <p className="mt-2 opacity-75">Run ComfyUI with: <code className="bg-black/30 px-1 rounded">--enable-cors-header "*"</code></p>
                </div>
             )}
           </div>
@@ -643,7 +638,7 @@ export default function App() {
           {/* Batch Actions Footer */}
           <div className="p-4 border-t border-gray-800 bg-gray-900 space-y-3">
             <h2 className="text-[10px] font-bold text-gray-500 uppercase tracking-wider">Batch Operations</h2>
-            
+
             <div className="grid grid-cols-2 gap-2">
               {isBatchRunning ? (
                  <button
@@ -658,9 +653,9 @@ export default function App() {
               ) : (
                 <button
                   onClick={startBatch}
-                  disabled={!connected || jobs.length === 0}
+                  disabled={!anyServerConnected || jobs.length === 0}
                   className={`col-span-2 py-3 rounded-lg font-bold text-sm flex items-center justify-center space-x-2 transition-all ${
-                    !connected || jobs.length === 0
+                    !anyServerConnected || jobs.length === 0
                     ? 'bg-gray-800 text-gray-600 cursor-not-allowed'
                     : 'bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-900/20'
                   }`}
@@ -671,7 +666,7 @@ export default function App() {
                   <span>Start All Pending</span>
                 </button>
               )}
-              
+
               <button
                 onClick={downloadAllCompleted}
                 disabled={!jobs.some(j => j.status === JobStatus.COMPLETED)}
@@ -689,7 +684,7 @@ export default function App() {
         {/* Main Content Area */}
         <main className="flex-1 bg-gray-950 p-6 overflow-hidden flex flex-col relative">
            {/* Background Pattern */}
-           <div className="absolute inset-0 opacity-5 pointer-events-none" 
+           <div className="absolute inset-0 opacity-5 pointer-events-none"
                 style={{ backgroundImage: 'radial-gradient(#4a5568 1px, transparent 1px)', backgroundSize: '24px 24px' }}>
            </div>
 

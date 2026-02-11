@@ -1,3 +1,18 @@
+// Server connection status
+export enum ServerStatus {
+  CONNECTED = 'CONNECTED',
+  DISCONNECTED = 'DISCONNECTED',
+  CHECKING = 'CHECKING',
+}
+
+// Server address configuration
+export interface ServerAddress {
+  id: string;
+  name: string; // Display name, e.g., "Server 1", "Main Server"
+  url: string; // Full URL with port, e.g., "http://192.168.31.150:8001"
+  status: ServerStatus;
+}
+
 export enum JobStatus {
   IDLE = 'IDLE',          // Added but not queued
   PENDING = 'PENDING',    // Waiting for processor to pick up

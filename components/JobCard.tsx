@@ -70,12 +70,22 @@ export const JobCard: React.FC<Props> = ({ job, onUpdateConfig, onStart, onStop,
     [JobStatus.FAILED]: 'bg-red-900/80 text-red-200 border-red-700',
   };
 
+  // Extract server info from URL for display
+  const getServerDisplayName = (url: string): string => {
+    try {
+      const urlObj = new URL(url);
+      return `${urlObj.hostname}:${urlObj.port}`;
+    } catch {
+      return url;
+    }
+  };
+
   return (
     <div className={`relative bg-gray-800 rounded-xl border flex flex-col transition-all duration-300 ${
-      isProcessing ? 'border-yellow-600/50 shadow-[0_0_15px_rgba(234,179,8,0.1)]' : 
+      isProcessing ? 'border-yellow-600/50 shadow-[0_0_15px_rgba(234,179,8,0.1)]' :
       isCompleted ? 'border-green-600/50' : 'border-gray-700'
     }`}>
-      
+
       {/* Media Area */}
       <div className="relative aspect-video bg-gray-900 rounded-t-xl overflow-hidden group">
         {isCompleted && job.resultUrl ? (
@@ -160,6 +170,13 @@ export const JobCard: React.FC<Props> = ({ job, onUpdateConfig, onStart, onStop,
         <div className="absolute top-2 right-2 z-10">
           <div className={`px-2 py-1 rounded text-[10px] font-bold uppercase border backdrop-blur-md shadow-sm ${StatusColor[job.status]}`}>
             {job.status} {job.status === JobStatus.PROCESSING && `${Math.round(job.progress)}%`}
+          </div>
+        </div>
+
+        {/* Server Info Badge */}
+        <div className="absolute top-2 left-2 z-10">
+          <div className="px-2 py-1 rounded text-[9px] font-mono font-medium bg-gray-900/80 border border-gray-700 text-gray-400 backdrop-blur-md shadow-sm">
+            {getServerDisplayName(job.config.serverAddress)}
           </div>
         </div>
 
